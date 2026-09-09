@@ -31,7 +31,7 @@ $Settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -WakeToRun -Multipl
 $CurrentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 $Principal = New-ScheduledTaskPrincipal -UserId $CurrentUser -LogonType Interactive -RunLevel Limited
 
-Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Settings $Settings -Principal $Principal -Description "Automatically launch Don't Starve Together once per day, wait for Klei online login, then close only the DST process started by this task." -Force | Out-Null
+Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Settings $Settings -Principal $Principal -Description "Automatically launch Don't Starve Together once per day, wait for Klei online login, post a background SPACE key to the DST window, then close only the DST process started by this task." -Force | Out-Null
 
 Write-Host ''
 Write-Host 'Installation completed.' -ForegroundColor Green

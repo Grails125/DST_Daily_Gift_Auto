@@ -6,7 +6,7 @@ param(
     [int]$StartupTimeoutSeconds = 600,
     [int]$LoginTimeoutSeconds = 360,
     [int]$MainMenuSettleSeconds = 15,
-    [int]$WindowActivationTimeoutSeconds = 60,
+    [int]$WindowMessageTimeoutSeconds = 60,
     [int]$RewardOpenWaitSeconds = 20
 )
 
@@ -182,46 +182,117 @@ function Wait-KleiLogin {
 }
 
 
+function Initialize-BackgroundInputApi {
+    if ('DSTBackgroundInput.NativeMethods' -as [type]) { return $true }
+
+    try {
+        Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+
+namespace DSTBackgroundInput
+{
+    public static class NativeMethods
+    {
+        [DllImport("user32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool PostMessage(IntPtr hWnd, UInt32 Msg, UIntPtr wParam, UIntPtr lParam);
+
+        [DllImport("user32.dll")]
+        public static extern UInt32 MapVirtualKey(UInt32 uCode, UInt32 uMapType);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool IsWindow(IntPtr hWnd);
+    }
+}
+"@ -ErrorAction Stop
+        return $true
+    }
+    catch {
+        Write-RunLog ("加载 Win32 后台按键 API 失败：{0}" -f $_.Exception.Message) 'ERROR'
+        return $false
+    }
+}
+
 function Send-DSTSpaceKey {
     param([int]$ProcessId, [int]$TimeoutSeconds = 60)
 
+    if (-not (Initialize-BackgroundInputApi)) { return $false }
+
+    $WM_KEYDOWN = [uint32]0x0100
+    $WM_KEYUP   = [uint32]0x0101
+    $VK_SPACE   = [uint32]0x20
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-    $shell = $null
-    try {
-        $shell = New-Object -ComObject WScript.Shell
-    }
-    catch {
-        Write-RunLog ("无法创建 WScript.Shell，不能发送空格键：{0}" -f $_.Exception.Message) 'ERROR'
-        return $false
-    }
 
     do {
         $p = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
         if (-not $p) {
-            Write-RunLog 'DST 在等待窗口激活期间已经退出。' 'ERROR'
+            Write-RunLog 'DST 在等待主窗口句柄期间已经退出。' 'ERROR'
             return $false
         }
 
         try {
             $p.Refresh()
-            if ($p.MainWindowHandle -ne 0) {
-                $activated = $shell.AppActivate($ProcessId)
-                if ($activated) {
-                    Start-Sleep -Milliseconds 1200
-                    $shell.SendKeys(' ')
-                    Write-RunLog ("已激活 DST 窗口 (PID {0}) 并发送一次空格键。" -f $ProcessId) 'OK'
+            $hWnd = [IntPtr]$p.MainWindowHandle
+            if ($hWnd -ne [IntPtr]::Zero -and [DSTBackgroundInput.NativeMethods]::IsWindow($hWnd)) {
+                # WM_KEYDOWN/WM_KEYUP 的 lParam：repeat=1，附带实际扫描码；KEYUP 再设置 previous/transition 位。
+                $scanCode = [uint32][DSTBackgroundInput.NativeMethods]::MapVirtualKey($VK_SPACE, 0)
+                $downValue = [uint64]1 + ([uint64]$scanCode * 65536)
+                $upValue = $downValue + [uint64]3221225472  # 0xC0000000
+
+                $downOk = [DSTBackgroundInput.NativeMethods]::PostMessage(
+                    $hWnd,
+                    $WM_KEYDOWN,
+                    [UIntPtr]([uint64]$VK_SPACE),
+                    [UIntPtr]$downValue
+                )
+
+                if (-not $downOk) {
+                    $err = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                    Write-RunLog ("向 DST 后台投递 WM_KEYDOWN 失败，Win32Error={0}。" -f $err) 'WARN'
+                    Start-Sleep -Seconds 2
+                    continue
+                }
+
+                Start-Sleep -Milliseconds 120
+
+                $upOk = [DSTBackgroundInput.NativeMethods]::PostMessage(
+                    $hWnd,
+                    $WM_KEYUP,
+                    [UIntPtr]([uint64]$VK_SPACE),
+                    [UIntPtr]$upValue
+                )
+
+                if (-not $upOk) {
+                    # KEYDOWN 已成功入队时，额外再尝试一次 KEYUP，避免按键状态卡住。
+                    Start-Sleep -Milliseconds 100
+                    $upOk = [DSTBackgroundInput.NativeMethods]::PostMessage(
+                        $hWnd,
+                        $WM_KEYUP,
+                        [UIntPtr]([uint64]$VK_SPACE),
+                        [UIntPtr]$upValue
+                    )
+                }
+
+                if ($upOk) {
+                    Write-RunLog ("已向 DST 主窗口后台投递一次 Space (PID {0}, HWND 0x{1:X})；未切换前台焦点。" -f $ProcessId, $hWnd.ToInt64()) 'OK'
                     return $true
                 }
+
+                $err = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                Write-RunLog ("WM_KEYDOWN 已投递，但 WM_KEYUP 投递失败，Win32Error={0}。" -f $err) 'ERROR'
+                return $false
             }
         }
         catch {
-            Write-RunLog ("尝试激活 DST 窗口时出现异常：{0}" -f $_.Exception.Message) 'WARN'
+            Write-RunLog ("尝试向 DST 后台窗口发送 Space 时出现异常：{0}" -f $_.Exception.Message) 'WARN'
         }
 
         Start-Sleep -Seconds 2
     } while ((Get-Date) -lt $deadline)
 
-    Write-RunLog ("等待 {0} 秒仍无法激活 DST 主窗口，未发送空格键。" -f $TimeoutSeconds) 'ERROR'
+    Write-RunLog ("等待 {0} 秒仍未获得有效 DST 主窗口句柄，未发送后台 Space。" -f $TimeoutSeconds) 'ERROR'
     return $false
 }
 
@@ -308,7 +379,7 @@ try {
             Write-RunLog ("在线登录已确认，等待 {0} 秒让主菜单稳定后自动打开礼物。" -f $MainMenuSettleSeconds)
             Start-Sleep -Seconds $MainMenuSettleSeconds
 
-            $spaceSent = Send-DSTSpaceKey -ProcessId $proc.Id -TimeoutSeconds $WindowActivationTimeoutSeconds
+            $spaceSent = Send-DSTSpaceKey -ProcessId $proc.Id -TimeoutSeconds $WindowMessageTimeoutSeconds
             if ($spaceSent) {
                 Write-RunLog ("空格键已发送，再等待 {0} 秒用于礼物开启动画/库存同步。" -f $RewardOpenWaitSeconds)
                 Start-Sleep -Seconds $RewardOpenWaitSeconds
@@ -316,13 +387,13 @@ try {
                 # 只有脚本启动的这个 PID 才会被关闭。
                 Stop-OurDST -ProcessId $proc.Id
 
-                $markerText = "{0}`r`nKlei online login detected and one SPACE key was sent to the activated DST window.`r`n" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+                $markerText = "{0}`r`nKlei online login detected and one SPACE key was posted directly to the DST window in background.`r`n" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
                 Set-Content -LiteralPath $SuccessMarker -Value $markerText -Encoding UTF8
                 Write-RunLog '自动打开礼物流程完成，并写入今日成功标记。' 'OK'
                 exit 0
             }
 
-            Write-RunLog 'Klei 登录成功，但自动发送空格键失败；本次不记为成功。' 'ERROR'
+            Write-RunLog 'Klei 登录成功，但后台发送空格键失败；本次不记为成功。' 'ERROR'
         }
 
         # 本次是脚本启动的实例，失败后关闭再重试。
